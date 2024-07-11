@@ -6,4 +6,23 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-candle-transformers = { git = "https://github.com/huggingface/candle", package = "candle-transformers", branch = "main" }
+accelerate-src = { version = "0.3.2", optional = true }
+candle-core = "0.5.1"
+candle-examples = "0.5.1"
+candle-nn = "0.5.1"
+candle-transformers = "0.5.1"
+csrc = { path = "./csrc", version = "0.1.0" }
+cudarc = { version = "0.11.7", features = ["std", "cublas", "cublaslt", "curand", "driver", "nvrtc", "f16", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
+half = "2.4.1"
+intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"], optional = true }
+serde = { version = "1.0.203", features = ["derive"] }
+tracing = "0.1.40"
+
+[features]
+default = ["cuda"]
+accelerate = ["dep:accelerate-src", "candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+cudnn = ["candle-core/cudnn"]
+flash-attn = ["cuda", "candle-transformers/flash-attn"]
+mkl = ["dep:intel-mkl-src", "candle-core/mkl", "candle-nn/mkl", "candle-transformers/mkl"]
+nccl = ["cuda", "cudarc/nccl"]
