@@ -637,7 +637,7 @@ impl FlashAttentionVarLen {
 
         let nseqlens_q = seqlens_q_layout.shape().dims1()?;
         let batch_size = nseqlens_q - 1;
-        let (_total_q, num_heads, head_size_og) = q_l.shape().dims3()?;
+        let (total_q, num_heads, head_size_og) = q_l.shape().dims3()?;
 
         let (block_table_ptr, block_table_layout) = if let Some(block_table) = &self.block_table {
             let (block_table_storage, block_table_layout) = block_table.storage_and_layout();
@@ -917,9 +917,7 @@ impl FlashAttentionVarLen {
 
         let elem_count = out_shape.elem_count();
         let dst = unsafe { dev.alloc::<T>(elem_count) }.w()?;
-        let softmax_lse = dev
-            .alloc_zeros::<f32>(batch_size * num_heads * self.max_seqlen_q)
-            .w()?;
+        let softmax_lse = dev.alloc_zeros::<f32>(total_q * num_heads).w()?;
 
         let is_bf16 = if is_bf16 { 1 } else { 0 };
 
@@ -1616,13 +1614,13 @@ impl FlashAttentionKvCache {
             candle_core::bail!("page_block_size must be a multiple of 16, got {page_block_size}")
         }
 
-        let seqlenq_ngroups_swapped = seqlen_q == 1
+        let _seqlenq_ngroups_swapped = seqlen_q == 1
             && num_heads > num_heads_k
             && self.window_size_left.is_none()
             && self.window_size_right.is_none()
             && head_size_og % 8 == 0
             && self.alibi_slopes.is_none();
-        // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
+        let seqlenq_ngroups_swapped = false; // TODO: remove this
         let (q_l, out_l, out_shape, seqlen_q, num_heads) = if seqlenq_ngroups_swapped {
             let ngroups = num_heads / num_heads_k;
             let new_shape = Shape::from((batch_size, ngroups, num_heads_k, head_size_og));
@@ -1789,7 +1787,7 @@ impl FlashAttentionKvCache {
             0
         };
 
-        if seqlen_q == 1 && !self.alibi_slopes.is_some() {
+        if seqlen_q == 1 && self.alibi_slopes.is_none() {
             // is_causal = true is the same as is_causal = false, in this case
             is_causal = 0;
         }
@@ -2135,12 +2133,14 @@ pub fn flash_attn_kv_cache_full(
     v: &Tensor,
     alibi_slopes: Option<&Tensor>,
     softmax_scale: f32,
-    window_size_left: Option<usize>,
-    window_size_right: Option<usize>,
     block_table: Option<&Tensor>,
     seqlens_k: Option<&Tensor>,
     softcap: Option<f32>,
+    causal: bool,
 ) -> Result<Tensor> {
+    let window_size_left = None;
+    let window_size_right = if causal { Some(0) } else { None };
+
     let op = FlashAttentionKvCache {
         softmax_scale,
         alibi_slopes: alibi_slopes.cloned(),

@@ -1,6 +1,6 @@
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use csrc::{
-    copy_blocks, flash_attn_kv_cache_full, flash_attn_varlen_with_block_table,
+    copy_blocks, flash_attn_kv_cache_full, flash_attn_varlen, flash_attn_varlen_with_block_table,
     reshape_and_cache_flash, swap_blocks,
 };
 use std::collections::HashMap;
@@ -390,19 +390,16 @@ impl FlashAttention {
                     .ok_or(candle_core::Error::Msg(
                     "Missing sequence start locations tensor for prefill inference".into(),
                 ))?;
-                let out = flash_attn_varlen_with_block_table(
+                let out = flash_attn_varlen(
                     &q,
                     &k,
                     &v,
-                    self.alibi_slopes.as_ref(),
                     sequence_start_locations,
                     sequence_start_locations,
                     prefill_metadata.max_prefill_sequence_length,
                     prefill_metadata.max_prefill_sequence_length,
                     self.softmax_scale,
-                    self.sliding_window,
-                    None,
-                    None,
+                    q_num_tokens > 1,
                 )?;
                 output.slice_assign(
                     &[..num_prefill_tokens, ..output.dims()[1], ..output.dims()[2]],
@@ -463,11 +460,10 @@ impl FlashAttention {
                 &v_cache,
                 self.alibi_slopes.as_ref(),
                 self.softmax_scale,
-                self.sliding_window,
-                None,
                 decoding_metadata.block_tables.as_ref(),
                 decoding_metadata.sequence_lengths.as_ref(),
                 None,
+                false,
             )?;
             output.slice_assign(&[num_prefill_tokens.., 0.., 0..], &out.squeeze(1)?)?
         } else {
@@ -698,15 +694,15 @@ mod tests {
             to_vec3_round(result, 4).unwrap(),
             &[
                 [
-                    [0.0837, 0.1038, 0.1238, 0.1438, 0.1637, 0.1837, 0.2037, 0.2238],
+                    [0.0, 0.02, 0.04, 0.06, 0.08, 0.1, 0.12, 0.14],
                     [0.0922, 0.1122, 0.1322, 0.1522, 0.1721, 0.1921, 0.2122, 0.2322]
                 ],
                 [
-                    [0.4204, 0.4404, 0.4604, 0.4805, 0.5005, 0.5205, 0.5405, 0.5605],
+                    [0.3201, 0.3401, 0.3601, 0.3801, 0.4001, 0.4202, 0.4402, 0.4602],
                     [0.428, 0.448, 0.468, 0.488, 0.5083, 0.5283, 0.5483, 0.5684]
                 ],
                 [
-                    [0.7554, 0.7754, 0.7954, 0.8154, 0.8354, 0.8555, 0.8755, 0.8955],
+                    [0.6401, 0.6602, 0.6802, 0.7002, 0.7202, 0.7402, 0.7603, 0.7803],
                     [0.7622, 0.7822, 0.8022, 0.8223, 0.8423, 0.8623, 0.8823, 0.9023]
                 ]
             ]

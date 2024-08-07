@@ -2,25 +2,8 @@ use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::{embedding, Embedding, VarBuilder};
 use candle_transformers::models::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::flash_attention::{FlashAttention, FlashAttentionMetadata};
-
-/// Saves a given `Tensor` to a file, with `filename`
-pub fn save_tensor_to_file(tensor: &Tensor, filename: &str) -> Result<()> {
-    use std::io::Write;
-    let json_output = serde_json::to_string(
-        &tensor
-            .to_device(&Device::Cpu)?
-            .flatten_all()?
-            .to_dtype(DType::F64)?
-            .to_vec1::<f64>()?,
-    )
-    .unwrap();
-    let mut file = std::fs::File::create(std::path::PathBuf::from(filename))?;
-    file.write_all(json_output.as_bytes())?;
-    Ok(())
-}
 
 /// Maximum input sequence token length
 const MAX_SEQ_LEN: usize = 4096;
@@ -82,7 +65,7 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn config_7b_v1(use_flash_attn: bool) -> Self {
+    pub fn config_7b_v1() -> Self {
         Self {
             hidden_size: 4096,
             intermediate_size: 11008,
@@ -97,7 +80,7 @@ impl Config {
         }
     }
 
-    pub fn config_7b_v2(use_flash_attn: bool) -> Self {
+    pub fn config_7b_v2() -> Self {
         Self {
             hidden_size: 4096,
             intermediate_size: 11008,
@@ -116,10 +99,8 @@ impl Config {
 #[derive(Clone, Debug)]
 /// Cache for Llama model
 pub struct Cache {
-    masks: HashMap<usize, Tensor>,
     cos: Tensor,
     sin: Tensor,
-    device: Device,
 }
 
 impl Cache {
@@ -140,10 +121,8 @@ impl Cache {
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
 
         Ok(Self {
-            masks: HashMap::new(),
             cos,
             sin,
-            device: device.clone(),
         })
     }
 }
@@ -165,7 +144,7 @@ struct CausalSelfAttention {
 impl CausalSelfAttention {
     fn apply_rotary_embed(&self, x: &Tensor, input_positions: &Tensor) -> Result<Tensor> {
         let _enter = self.span_rot.enter();
-        let (b_sz, num_heads, num_total_tokens, hidden_size) = x.dims4()?; // [1, num_heads, num_total_tokens, hidden_size]
+        let (b_sz, _num_heads, num_total_tokens, _hidden_size) = x.dims4()?; // [1, num_heads, num_total_tokens, hidden_size]
 
         if b_sz != 1 {
             candle_core::bail!("batch size must be 1, got {}", b_sz);
@@ -205,7 +184,7 @@ impl CausalSelfAttention {
         kv_cache: &Tensor,
         attention_metadata: &FlashAttentionMetadata,
     ) -> Result<Tensor> {
-        let (batch_size, num_total_tokens, hidden_size) = x.dims3()?;
+        let (_batch_size, num_total_tokens, _hidden_size) = x.dims3()?;
         let b_sz = 1;
         if x.dims()[0] != b_sz {
             candle_core::bail!(
@@ -237,22 +216,20 @@ impl CausalSelfAttention {
             ))?
             .transpose(1, 2)?
             .contiguous()?;
-        let mut v = v
-            .reshape((
-                b_sz,
-                num_total_tokens,
-                self.num_key_value_heads,
-                self.head_dim,
-            ))?
-            .transpose(1, 2)?;
+        let v = v.reshape((
+            b_sz,
+            num_total_tokens,
+            self.num_key_value_heads,
+            self.head_dim,
+        ))?;
 
         let q = self.apply_rotary_embed(&q, input_positions)?;
         let k = self.apply_rotary_embed(&k, input_positions)?;
 
-        // transpose the matrices back to [batch_size, num_heads, sequence_length, head_dim]
-        let q = q.transpose(1, 2)?.squeeze(0)?;
-        let k = k.transpose(1, 2)?.squeeze(0)?;
-        let v = v.transpose(1, 2)?.squeeze(0)?;
+        // transpose the matrices back to [sequence_length, num_heads, head_dim]
+        let q = q.transpose(1, 2)?.squeeze(0)?.contiguous()?;
+        let k = k.transpose(1, 2)?.squeeze(0)?.contiguous()?;
+        let v = v.squeeze(0)?;
 
         let o = self
             .attention
@@ -386,8 +363,6 @@ pub struct Llama {
     ln_f: RmsNorm,
     lm_head: Linear,
     cfg: Config,
-    dtype: DType,
-    device: Device,
 }
 
 impl Llama {
@@ -424,7 +399,6 @@ impl Llama {
         for (i, block) in self.blocks.iter_mut().enumerate() {
             x = block.forward(&x, input_positions, &kv_caches[i], &attention_metadata)?;
         }
-        save_tensor_to_file(&x, "attn_output")?;
         let x = self.ln_f.forward(&x)?;
         let x = x.index_select(selected_token_indices, 1)?.contiguous()?;
         let logits = self.lm_head.forward(&x)?;
@@ -444,9 +418,7 @@ impl Llama {
             blocks,
             ln_f,
             lm_head,
-            cfg: cfg.clone(),
-            dtype: dtype,
-            device: device.clone(),
+            cfg: cfg.clone()
         })
     }
 
@@ -460,7 +432,6 @@ mod tests {
     use super::*;
     use crate::flash_attention::{FlashAttentionDecodingMetadata, FlashAttentionPrefillMetadata};
     use candle_transformers::generation::{LogitsProcessor, Sampling};
-    use core::panic;
     use hf_hub::{api::sync::Api, Repo, RepoType};
     use std::io::Write;
     use tokenizers::Tokenizer;
@@ -493,7 +464,6 @@ mod tests {
         let filenames = vec![api
             .get("model.safetensors")
             .expect("Failed to get model.safetensors")];
-        let cache = Cache::new(&config, &device, dtype)?;
         let mut llama_model = {
             let vb = unsafe { VarBuilder::from_mmaped_safetensors(&filenames, dtype, &device)? };
             Llama::load(vb, &config, dtype, &device).expect("Failed to load the model")
@@ -520,8 +490,8 @@ mod tests {
             LogitsProcessor::from_sampling(42, sampling)
         };
 
-        let sample_len = 100;
-        let mut start_gen = std::time::Instant::now();
+        let sample_len = 32;
+        let start_gen = std::time::Instant::now();
         let mut index_pos = 0;
         let mut token_generated = 0;
 
@@ -530,15 +500,17 @@ mod tests {
         let block_size = 16;
         let num_key_value_heads = config.num_key_value_heads;
         let head_dim = config.hidden_size / config.num_attention_heads;
-        let mut kv_cache = vec![
+        let mut kv_cache = std::iter::repeat_with(|| {
             Tensor::zeros(
                 (2, num_blocks, block_size, num_key_value_heads, head_dim),
                 dtype,
                 &device,
-            )?;
-            config.num_hidden_layers as usize
-        ];
-        let mut kv_cache = kv_cache.iter_mut().collect();
+            )
+        })
+        .take(config.num_hidden_layers)
+        .collect::<Result<Vec<_>>>()?;
+
+        let kv_cache = kv_cache.iter_mut().collect();
 
         // prefill forward pass
         let input_positions = Tensor::arange(0, tokens.len() as i64, &device)?.unsqueeze(0)?;
@@ -586,20 +558,20 @@ mod tests {
         }
 
         // decoding loop
-        for index in 1..sample_len {
-            let context = [next_token];
-            let input = Tensor::new(&context[..], &device)?.unsqueeze(0)?;
+        for _ in 1..sample_len {
+            let input = Tensor::new(&[next_token], &device)?.unsqueeze(0)?;
             let input_positions = Tensor::new(&[tokens.len() as i64 - 1], &device)?.unsqueeze(0)?;
-            let selected_token_indices = Tensor::new(&[tokens.len() as u32 - 1], &device)?;
+            let selected_token_indices = Tensor::new(&[0u32], &device)?;
+            let num_blocks = (tokens.len() / block_size) as i64 + 1;
             let attention_metadata = FlashAttentionMetadata {
                 context_lengths: None,
                 slot_mapping: Tensor::new(&[tokens.len() as i64 - 1], &device)?,
                 decoding_metadata: Some(FlashAttentionDecodingMetadata {
                     block_tables: Some(
-                        Tensor::new(&[(tokens.len() / block_size) as i64], &device)?
-                            .reshape((1, 1))?,
+                        Tensor::arange(0, num_blocks, &device)?
+                            .reshape((1, num_blocks as usize))?,
                     ),
-                    max_decoding_sequence_length: 1,
+                    max_decoding_sequence_length: tokens.len(),
                     sequence_lengths: Some(Tensor::new(&[tokens.len() as u32], &device)?),
                 }),
                 prefill_metadata: None,
@@ -619,7 +591,7 @@ mod tests {
 
             index_pos += 1;
 
-            let next_token = logits_processor.sample(&logits)?;
+            next_token = logits_processor.sample(&logits)?;
             token_generated += 1;
             tokens.push(next_token);
 
