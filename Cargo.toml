@@ -23,4 +23,6 @@ serde_json = "1.0.120"
 candle-examples = { version = "0.6.0", features = ["cuda"] }
 hf-hub = "0.3.2"
 serde_json = "1.0.120"
+serial_test = "3.1.1"
 tokenizers = "0.19.1"
+
